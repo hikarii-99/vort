@@ -1,10 +1,6 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { pipeline } = require('stream/promises');
 const { generateWAMessageFromContent, proto, prepareWAMessageMedia } = require('baileys');
 
 const BASE_URL = "https://animeheaven.me";
@@ -49,16 +45,6 @@ function freeMemory() {
     }
 }
 
-function safeUnlink(filePath) {
-    if (filePath && fs.existsSync(filePath)) {
-        try {
-            fs.unlinkSync(filePath);
-        } catch (e) {
-            console.error("Failed to delete temp file:", e.message);
-        }
-    }
-}
-
 async function fetchWithRetry(url, options = {}, retries = 3) {
     try {
         return await client.get(url, options);
@@ -84,7 +70,7 @@ function clearUserSession(socket, senderID) {
 
 module.exports = {
     command: ['ah2'],
-    description: 'Download Anime from AnimeHeaven and send cleanly to multiple groups',
+    description: 'Download Anime from AnimeHeaven and send cleanly to multiple groups (Buffer Mode)',
     ownerOnly: false,
 
     handler: async ({ socket, msg, sender, args, prefix }) => {
@@ -344,21 +330,20 @@ module.exports = {
 
                             const cleanTitle = selectedAnime.title.replace(/[\\/:*?"<>|]/g, '').trim();
                             const fileName = `${cleanTitle} Episode ${selectedEp.episode}.mp4`;
-                            const tempFilePath = path.join(os.tmpdir(), `ah2_${Date.now()}_ep_${selectedEp.episode}.mp4`);
 
                             const maxUploadRetries = 3;
                             let uploadSuccess = false;
                             let lastError = null;
 
                             for (let attempt = 1; attempt <= maxUploadRetries; attempt++) {
-                                let responseStream = null;
+                                let videoBuffer = null;
                                 try {
                                     if (attempt > 1) {
                                         await socket.sendMessage(epSenderID, { react: { text: '🔄', key: epReply.key } });
                                     }
 
-                                    const videoStreamRes = await axios.get(videoUrl, {
-                                        responseType: 'stream',
+                                    const videoRes = await axios.get(videoUrl, {
+                                        responseType: 'arraybuffer',
                                         timeout: 120000,
                                         httpsAgent: httpsAgent,
                                         headers: {
@@ -367,18 +352,18 @@ module.exports = {
                                         }
                                     });
 
-                                    responseStream = videoStreamRes.data;
-                                    const writer = fs.createWriteStream(tempFilePath);
-                                    await pipeline(responseStream, writer);
+                                    videoBuffer = Buffer.from(videoRes.data);
 
                                     const preparedMedia = await prepareWAMessageMedia(
                                         {
-                                            document: { url: tempFilePath },
+                                            document: videoBuffer,
                                             mimetype: 'video/mp4',
                                             fileName: fileName
                                         },
                                         { upload: socket.waUploadToServer }
                                     );
+
+                                    videoBuffer = null;
 
                                     for (const targetJid of TARGET_JIDS) {
                                         const waMsg = generateWAMessageFromContent(
@@ -392,16 +377,12 @@ module.exports = {
 
                                     await socket.sendMessage(epSenderID, { react: { text: '✅', key: epReply.key } });
                                     uploadSuccess = true;
-                                    safeUnlink(tempFilePath);
                                     freeMemory();
                                     break;
 
                                 } catch (e) {
                                     lastError = e;
-                                    if (responseStream && typeof responseStream.destroy === 'function') {
-                                        responseStream.destroy();
-                                    }
-                                    safeUnlink(tempFilePath);
+                                    videoBuffer = null;
                                     freeMemory();
                                     console.error(`Upload attempt ${attempt}/${maxUploadRetries} failed:`, e.message);
                                     if (attempt < maxUploadRetries) {
@@ -411,7 +392,6 @@ module.exports = {
                             }
 
                             if (!uploadSuccess) {
-                                safeUnlink(tempFilePath);
                                 await socket.sendMessage(epSenderID, { react: { text: '❌', key: epReply.key } });
                                 await socket.sendMessage(epSenderID, {
                                     text: `❌ *Failed to upload Ep ${selectedEp.episode} after ${maxUploadRetries} attempts:*\n` + (lastError?.message || "Unknown Error") + "\n\n📥 *Direct Link:*\n" + videoUrl
