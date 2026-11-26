@@ -1,10 +1,6 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { pipeline } = require('stream/promises');
 const { generateWAMessageFromContent, proto, prepareWAMessageMedia } = require('baileys');
 
 const BASE_URL = "https://animeheaven.me";
@@ -42,17 +38,6 @@ function freeMemory() {
     }
 }
 
-// Safely delete temporary file from disk
-function safeUnlink(filePath) {
-    if (filePath && fs.existsSync(filePath)) {
-        try {
-            fs.unlinkSync(filePath);
-        } catch (e) {
-            console.error("Failed to delete temp file:", e.message);
-        }
-    }
-}
-
 async function fetchWithRetry(url, options = {}, retries = 3) {
     try {
         return await client.get(url, options);
@@ -79,7 +64,7 @@ function clearUserSession(socket, senderID) {
 
 const plugin = {
     command: ['ah', 'anime', 'animeheaven'],
-    description: 'Download Anime from AnimeHeaven (Low RAM / High Capacity)',
+    description: 'Download Anime from AnimeHeaven (Buffer Mode)',
     ownerOnly: false,
 
     handler: async ({ socket, msg, sender, args, prefix }) => {
@@ -238,7 +223,6 @@ const plugin = {
                         return await socket.sendMessage(senderID, { text: "❌ *No episodes found for this anime!*" }, { quoted: reply });
                     }
 
-                    // Sort episodes in ascending order (Episode 1 -> 12 instead of 12 -> 1)
                     episodes.sort((a, b) => {
                         const numA = parseFloat(a.episode);
                         const numB = parseFloat(b.episode);
@@ -248,7 +232,6 @@ const plugin = {
                         return String(a.episode).localeCompare(String(b.episode), undefined, { numeric: true });
                     });
 
-                    // Support up to 249 episodes (+1 row for Download All)
                     const epLimit = episodes.slice(0, 249);
 
                     const epMedia = await prepareWAMessageMedia(
@@ -262,7 +245,6 @@ const plugin = {
                         id: `ah_ep_${i + 1}`
                     }));
 
-                    // Add "Download All" option at the bottom of the episode list
                     epRows.push({
                         title: "📥 Download All Episodes",
                         description: `Download all ${epLimit.length} episodes in order (Ep ${epLimit[0].episode} to Ep ${epLimit[epLimit.length - 1].episode})`,
@@ -306,7 +288,6 @@ const plugin = {
                     await socket.relayMessage(senderID, epFullMsg.message, { messageId: epFullMsg.key.id });
                     const epMsgId = epFullMsg.key.id;
 
-                    // Process episode queue sequentially without overloading RAM
                     const processQueue = async (session) => {
                         if (session.isProcessing || session.queue.length === 0) return;
                         session.isProcessing = true;
@@ -316,7 +297,6 @@ const plugin = {
                             const { epNum, epReply, epSenderID } = task;
                             const selectedEp = epLimit[epNum - 1];
 
-                            // Extend session timeout to 2 hours on each activity
                             clearTimeout(session.timeout);
                             session.timeout = setTimeout(() => clearUserSession(socket, senderID), 2 * 60 * 60 * 1000);
 
@@ -344,22 +324,21 @@ const plugin = {
                             }
 
                             const fileName = selectedAnime.title.replace(/[^a-zA-Z0-9]/g, '_') + "_Ep_" + selectedEp.episode + ".mp4";
-                            const tempFilePath = path.join(os.tmpdir(), `ah_${Date.now()}_ep_${selectedEp.episode}.mp4`);
 
                             const maxUploadRetries = 3;
                             let uploadSuccess = false;
                             let lastError = null;
 
                             for (let attempt = 1; attempt <= maxUploadRetries; attempt++) {
-                                let responseStream = null;
+                                let videoBuffer = null;
                                 try {
                                     if (attempt > 1) {
                                         await socket.sendMessage(epSenderID, { react: { text: '🔄', key: epReply.key } });
                                     }
 
-                                    // Step 1: Stream directly to temporary disk file (Zero RAM spike!)
-                                    const videoStreamRes = await axios.get(videoUrl, {
-                                        responseType: 'stream',
+                                    // Step 1: Download directly into Buffer (RAM)
+                                    const videoRes = await axios.get(videoUrl, {
+                                        responseType: 'arraybuffer',
                                         timeout: 120000,
                                         httpsAgent: httpsAgent,
                                         headers: {
@@ -368,13 +347,11 @@ const plugin = {
                                         }
                                     });
 
-                                    responseStream = videoStreamRes.data;
-                                    const writer = fs.createWriteStream(tempFilePath);
-                                    await pipeline(responseStream, writer);
+                                    videoBuffer = Buffer.from(videoRes.data);
 
-                                    // Step 2: Upload from local disk file using Baileys url path
+                                    // Step 2: Upload directly from Buffer
                                     await socket.sendMessage(epSenderID, {
-                                        document: { url: tempFilePath },
+                                        document: videoBuffer,
                                         mimetype: 'video/mp4',
                                         fileName: fileName,
                                         caption: "🎌 *" + selectedAnime.title + "*\n🎬 Episode: " + selectedEp.episode + "\n\n💡 _Select another episode from the list above to download the next one._\n\n> *Powered by VORTEX*"
@@ -382,16 +359,13 @@ const plugin = {
 
                                     await socket.sendMessage(epSenderID, { react: { text: '✅', key: epReply.key } });
                                     uploadSuccess = true;
-                                    safeUnlink(tempFilePath);
+                                    videoBuffer = null;
                                     freeMemory();
                                     break;
 
                                 } catch (e) {
                                     lastError = e;
-                                    if (responseStream && typeof responseStream.destroy === 'function') {
-                                        responseStream.destroy();
-                                    }
-                                    safeUnlink(tempFilePath);
+                                    videoBuffer = null;
                                     freeMemory();
                                     console.error(`Upload attempt ${attempt}/${maxUploadRetries} failed:`, e.message);
                                     if (attempt < maxUploadRetries) {
@@ -401,14 +375,12 @@ const plugin = {
                             }
 
                             if (!uploadSuccess) {
-                                safeUnlink(tempFilePath);
                                 await socket.sendMessage(epSenderID, { react: { text: '❌', key: epReply.key } });
                                 await socket.sendMessage(epSenderID, {
                                     text: `❌ *Failed to upload Ep ${selectedEp.episode} after ${maxUploadRetries} attempts:*\n` + (lastError?.message || "Unknown Error") + "\n\n📥 *Direct Link:*\n" + videoUrl
                                 }, { quoted: epReply });
                             }
 
-                            // Brief pause between downloads to let Node.js clear memory buffers
                             await delay(1500);
                         }
 
@@ -441,7 +413,6 @@ const plugin = {
                         const session = activeSessions.get(senderID);
                         if (!session) return;
 
-                        // Handle "Download All" selection (or replying "all")
                         if (epSelectedOption.toLowerCase() === 'all') {
                             for (let i = 1; i <= epLimit.length; i++) {
                                 session.queue.push({ epNum: i, epReply, epSenderID });
@@ -461,7 +432,6 @@ const plugin = {
                         const epNum = parseInt(epSelectedOption);
 
                         if (!isNaN(epNum) && epNum >= 1 && epNum <= epLimit.length) {
-                            // Add single episode to download queue
                             session.queue.push({ epNum, epReply, epSenderID });
 
                             if (session.isProcessing) {
@@ -477,7 +447,6 @@ const plugin = {
 
                     socket.ev.on('messages.upsert', epHandler);
                     
-                    // Automatically clear session after 2 hours of inactivity
                     const epTimeout = setTimeout(() => clearUserSession(socket, senderID), 2 * 60 * 60 * 1000);
                     
                     activeSessions.set(senderID, {
