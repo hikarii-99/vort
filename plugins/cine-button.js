@@ -1,7 +1,5 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
 const { generateWAMessageFromContent, proto, prepareWAMessageMedia } = require('baileys');
 
 // Imports with aliased names to avoid the restricted word
@@ -360,8 +358,7 @@ async function downloadFromCloud(srcLink, socket, sender, quoted, title) {
         if (!message) throw new Error('Message not found.');
     }
 
-    if (!message) throw new Error('No media found.');
-    if (!message.media) throw new Error('No media found.');
+    if (!message || !message.media) throw new Error('No media found.');
 
     let fileName = 'file';
     let fileSize = 0;
@@ -379,21 +376,18 @@ async function downloadFromCloud(srcLink, socket, sender, quoted, title) {
     }
 
     fileName = cleanFileName(fileName);
-    const dir = path.join(process.cwd(), 'downloads', 'cinesubz');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const filePath = path.join(dir, Date.now() + '_' + fileName);
 
     await socket.sendMessage(sender, {
-        text: `⬇️ *Downloading...*\n\n📄 ${fileName}\n📦 ${formatBytes(fileSize)}`
+        text: `⬇️ *Downloading to Buffer...*\n\n📄 ${fileName}\n📦 ${formatBytes(fileSize)}`
     }, { quoted });
 
-    await client.downloadMedia(message.media, { outputFile: filePath, workers: 4 });
+    let fileBuffer = await client.downloadMedia(message.media, { workers: 4 });
 
-    if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
-        throw new Error('Download failed (empty file).');
+    if (!fileBuffer || fileBuffer.length === 0) {
+        throw new Error('Download failed (empty buffer).');
     }
 
-    const size = fs.statSync(filePath).size;
+    const size = fileBuffer.length;
     const isLarge = size > 64 * 1024 * 1024;
     const isVideo = mimeType.startsWith('video/') && !isLarge;
 
@@ -404,18 +398,18 @@ async function downloadFromCloud(srcLink, socket, sender, quoted, title) {
     const caption = `🎬 *${title}*\n\n✅ Downloaded successfully\n📄 ${fileName}\n📦 ${formatBytes(size)}\n\n> VORTEX MD`;
 
     if (isVideo) {
-        await socket.sendMessage(sender, { video: { url: filePath }, caption, mimetype: mimeType }, { quoted });
+        await socket.sendMessage(sender, { video: fileBuffer, caption, mimetype: mimeType }, { quoted });
     } else {
-        await socket.sendMessage(sender, { document: { url: filePath }, fileName, mimetype: mimeType, caption }, { quoted });
+        await socket.sendMessage(sender, { document: fileBuffer, fileName, mimetype: mimeType, caption }, { quoted });
     }
 
-    try { fs.unlinkSync(filePath); } catch (e) {}
+    fileBuffer = null;
 }
 
 // ==================== PLUGIN ====================
 module.exports = {
     command: ['cinesubz', 'csz', 'movie', 'film'],
-    description: 'Search & Download Movies / TV Series',
+    description: 'Search & Download Movies / TV Series (Buffer Mode)',
     ownerOnly: false,
 
     handler: async ({ socket, msg, sender, args, prefix }) => {
